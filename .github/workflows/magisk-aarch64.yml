@@ -1,0 +1,126 @@
+name: EasyTier Magisk Module (aarch64)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: aarch64-unknown-linux-musl
+  MODULE_DIR: easytier-contrib/easytier-magisk
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build_web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Frontend Environment
+        uses: ./.github/actions/prepare-pnpm
+        with:
+          token: ${{ github.token }}
+          build-filter: './easytier-web/*'
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-web-dashboard
+          path: easytier-web/frontend/dist/*
+          if-no-files-found: error
+
+  build_aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set current ref as env variable
+        run: echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: ${{ env.TARGET }}
+          gui: false
+          pnpm: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: "magisk-aarch64"
+          cache-targets: "false"
+
+      - name: Build
+        run: |
+          cargo build --release --target $TARGET \
+            --package=easytier --package=easytier-web \
+            --features=easytier/mimalloc
+
+      - name: Compress
+        run: |
+          mkdir -p ./artifacts
+          UPX_VERSION=4.2.4
+          UPX_PKG="upx-${UPX_VERSION}-arm64_linux"
+          curl -L "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${UPX_PKG}.tar.xz" -s | tar xJf -
+          cp "${UPX_PKG}/upx" .
+
+          for BIN in ./target/$TARGET/release/easytier-{core,cli,web}; do
+            ./upx --lzma --best "$BIN" || true
+            mv "$BIN" ./artifacts/
+          done
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-linux-aarch64
+          path: ./artifacts/*
+          if-no-files-found: error
+
+  build_magisk:
+    runs-on: ubuntu-latest
+    needs: [ build_web, build_aarch64 ]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download Linux aarch64 binaries
+        uses: actions/download-artifact@v5
+        with:
+          name: easytier-linux-aarch64
+          path: ./downloaded-binaries/
+
+      - name: Download Magisk WebUI
+        uses: actions/download-artifact@v5
+        with:
+          name: easytier-web-dashboard
+          path: ./downloaded-webui/
+
+      - name: Prepare Magisk module
+        run: |
+          mkdir -p "$MODULE_DIR/webroot"
+          cp ./downloaded-binaries/easytier-core "$MODULE_DIR/"
+          cp ./downloaded-binaries/easytier-cli "$MODULE_DIR/"
+          cp ./downloaded-binaries/easytier-web "$MODULE_DIR/"
+          cp -R ./downloaded-webui/config-generator/. "$MODULE_DIR/webroot/"
+          test -f "$MODULE_DIR/webroot/index.html"
+          rm -f "$MODULE_DIR/build.sh" "$MODULE_DIR/magisk_update.json"
+
+      - name: Zip flashable module
+        run: |
+          cd "$MODULE_DIR"
+          zip -r "../../Easytier-Magisk-aarch64-${GITHUB_SHA::7}.zip" .
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: Easytier-Magisk-aarch64
+          path: |
+            ./Easytier-Magisk-aarch64-*.zip
+            ./easytier-contrib/easytier-magisk/**
+          if-no-files-found: error
